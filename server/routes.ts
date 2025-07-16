@@ -12,17 +12,85 @@ import path from "path";
 import fs from "fs";
 import { PythonShell } from "python-shell";
 
-// Setup multer for file uploads
-const uploadsDir = process.env.UPLOADS_DIR;
+// Setup multer for file uploads with proper validation
+const uploadsDir =
+	process.env.UPLOADS_DIR || path.join(process.cwd(), "uploads");
+const resultDir =
+	process.env.RESULTS_DIR || path.join(process.cwd(), "results");
 
-const resultDir = process.env.RESULTS_DIR;
+// Security: Validate environment variables to prevent malicious paths
+if (
+	process.env.UPLOADS_DIR &&
+	(process.env.UPLOADS_DIR.includes("..") ||
+		process.env.UPLOADS_DIR.includes("~"))
+) {
+	throw new Error("Invalid UPLOADS_DIR: Path traversal attempts detected");
+}
+if (
+	process.env.RESULTS_DIR &&
+	(process.env.RESULTS_DIR.includes("..") ||
+		process.env.RESULTS_DIR.includes("~"))
+) {
+	throw new Error("Invalid RESULTS_DIR: Path traversal attempts detected");
+}
+
+// Ensure directories exist and are properly secured
+if (!fs.existsSync(uploadsDir)) {
+	fs.mkdirSync(uploadsDir, { recursive: true });
+}
+if (!fs.existsSync(resultDir)) {
+	fs.mkdirSync(resultDir, { recursive: true });
+}
+
+// Security: Normalize and validate directory paths to prevent path traversal
+const normalizedUploadsDir = path.resolve(uploadsDir);
+const normalizedResultDir = path.resolve(resultDir);
+
+// Security utility function to validate file paths and prevent path traversal
+function validateFilePath(filePath: string, allowedDirectory: string): boolean {
+	try {
+		// Normalize the file path to resolve any relative path components
+		const normalizedPath = path.resolve(filePath);
+		const normalizedAllowedDir = path.resolve(allowedDirectory);
+
+		// Check if the normalized path starts with the allowed directory
+		// This prevents path traversal attacks like "../../../etc/passwd"
+		const isWithinAllowedDir =
+			normalizedPath.startsWith(normalizedAllowedDir + path.sep) ||
+			normalizedPath === normalizedAllowedDir;
+
+		// Additional security checks
+		const containsDangerousPatterns =
+			filePath.includes("..") ||
+			filePath.includes("~") ||
+			filePath.includes("\0") || // null byte
+			filePath.includes("%00"); // URL encoded null byte
+
+		return isWithinAllowedDir && !containsDangerousPatterns;
+	} catch (error) {
+		// If there's any error in path resolution, reject the path
+		return false;
+	}
+}
+
+// Security function to sanitize filename
+function sanitizeFilename(filename: string): string {
+	// Remove dangerous characters and path traversal attempts
+	return filename
+		.replace(/[<>:"/\\|?*\0]/g, "") // Remove filesystem-dangerous characters
+		.replace(/\.\./g, "") // Remove path traversal attempts
+		.replace(/^\.+/, "") // Remove leading dots
+		.slice(0, 255); // Limit filename length
+}
 const storage_config = multer.diskStorage({
 	destination: function (req, file, cb) {
-		cb(null, uploadsDir);
+		cb(null, normalizedUploadsDir);
 	},
 	filename: function (req, file, cb) {
 		const uniqueSuffix = Date.now() + "-" + Math.round(Math.random() * 1e9);
-		cb(null, uniqueSuffix + path.extname(file.originalname));
+		const sanitizedOriginalName = sanitizeFilename(file.originalname);
+		const extension = path.extname(sanitizedOriginalName);
+		cb(null, uniqueSuffix + extension);
 	},
 });
 
@@ -102,6 +170,17 @@ export async function registerRoutes(app: Express): Promise<Server> {
 			try {
 				if (!req.file) {
 					return res.status(400).json({ message: "No file uploaded" });
+				}
+
+				// Security: Validate uploaded file path
+				if (!validateFilePath(req.file.path, normalizedUploadsDir)) {
+					// Clean up the invalid file
+					if (fs.existsSync(req.file.path)) {
+						fs.unlinkSync(req.file.path);
+					}
+					return res
+						.status(403)
+						.json({ message: "Access denied: Invalid file path" });
 				}
 
 				const track = await storage.createAudioTrack({
@@ -190,15 +269,25 @@ export async function registerRoutes(app: Express): Promise<Server> {
 		try {
 			const tracks = await storage.getAudioTracksByUserId(demoUser.id);
 
-			// Delete files
+			// Delete files with security validation
 			for (const track of tracks) {
-				if (fs.existsSync(track.originalPath)) {
-					fs.unlinkSync(track.originalPath);
+				// Validate and delete original file
+				if (
+					track.originalPath &&
+					validateFilePath(track.originalPath, normalizedUploadsDir)
+				) {
+					if (fs.existsSync(track.originalPath)) {
+						fs.unlinkSync(track.originalPath);
+					}
 				}
-				if (track.extendedPaths) {
-					for (const path of track.extendedPaths) {
-						if (fs.existsSync(path)) {
-							fs.unlinkSync(path);
+
+				// Validate and delete extended files
+				if (track.extendedPaths && Array.isArray(track.extendedPaths)) {
+					for (const filePath of track.extendedPaths) {
+						if (validateFilePath(filePath, normalizedResultDir)) {
+							if (fs.existsSync(filePath)) {
+								fs.unlinkSync(filePath);
+							}
 						}
 					}
 				}
@@ -254,8 +343,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
 			const fileExt = path.extname(track.originalFilename);
 			const version = track.extendedPaths?.length || 0;
 			const outputPath = path.join(
-				resultDir,
-				`${outputBase}_extended_v${version + 1}${fileExt}`
+				normalizedResultDir,
+				`${sanitizeFilename(outputBase)}_extended_v${version + 1}${fileExt}`
 			);
 
 			// Execute the Python script for audio processing
@@ -401,9 +490,14 @@ export async function registerRoutes(app: Express): Promise<Server> {
 				return res.status(400).json({ message: "Invalid file type" });
 			}
 
-			// Security: Prevent path traversal attempts
-			if (filePath.includes("..") || filePath.includes("~")) {
-				return res.status(400).json({ message: "Invalid file path" });
+			// Security: Validate file path to prevent path traversal
+			const isUploadFile = validateFilePath(filePath, normalizedUploadsDir);
+			const isResultFile = validateFilePath(filePath, normalizedResultDir);
+
+			if (!isUploadFile && !isResultFile) {
+				return res
+					.status(403)
+					.json({ message: "Access denied: Invalid file path" });
 			}
 
 			if (!fs.existsSync(filePath)) {
@@ -478,9 +572,11 @@ export async function registerRoutes(app: Express): Promise<Server> {
 				return res.status(400).json({ message: "Invalid file type" });
 			}
 
-			// Security: Prevent path traversal attempts
-			if (filePath.includes("..") || filePath.includes("~")) {
-				return res.status(400).json({ message: "Invalid file path" });
+			// Security: Validate file path to prevent path traversal
+			if (!validateFilePath(filePath, normalizedResultDir)) {
+				return res
+					.status(403)
+					.json({ message: "Access denied: Invalid file path" });
 			}
 
 			if (!fs.existsSync(filePath)) {
