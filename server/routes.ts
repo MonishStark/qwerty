@@ -18,57 +18,108 @@ const uploadsDir =
 const resultDir =
 	process.env.RESULTS_DIR || path.join(process.cwd(), "results");
 
-// Security: Validate environment variables to prevent malicious paths
-if (
-	process.env.UPLOADS_DIR &&
-	(process.env.UPLOADS_DIR.includes("..") ||
-		process.env.UPLOADS_DIR.includes("~"))
-) {
-	throw new Error("Invalid UPLOADS_DIR: Path traversal attempts detected");
-}
-if (
-	process.env.RESULTS_DIR &&
-	(process.env.RESULTS_DIR.includes("..") ||
-		process.env.RESULTS_DIR.includes("~"))
-) {
-	throw new Error("Invalid RESULTS_DIR: Path traversal attempts detected");
+// Security: Validate and canonicalize directory paths to prevent malicious paths
+let normalizedUploadsDir: string;
+let normalizedResultDir: string;
+
+try {
+	normalizedUploadsDir = validateAndCanonicalizeDirectory(uploadsDir);
+	normalizedResultDir = validateAndCanonicalizeDirectory(resultDir);
+} catch (error) {
+	console.error("Directory validation failed:", error);
+	throw error;
 }
 
 // Ensure directories exist and are properly secured
-if (!fs.existsSync(uploadsDir)) {
-	fs.mkdirSync(uploadsDir, { recursive: true });
+if (!fs.existsSync(normalizedUploadsDir)) {
+	fs.mkdirSync(normalizedUploadsDir, { recursive: true });
 }
-if (!fs.existsSync(resultDir)) {
-	fs.mkdirSync(resultDir, { recursive: true });
+if (!fs.existsSync(normalizedResultDir)) {
+	fs.mkdirSync(normalizedResultDir, { recursive: true });
 }
-
-// Security: Normalize and validate directory paths to prevent path traversal
-const normalizedUploadsDir = path.resolve(uploadsDir);
-const normalizedResultDir = path.resolve(resultDir);
 
 // Security utility function to validate file paths and prevent path traversal
 function validateFilePath(filePath: string, allowedDirectory: string): boolean {
 	try {
-		// Normalize the file path to resolve any relative path components
-		const normalizedPath = path.resolve(filePath);
-		const normalizedAllowedDir = path.resolve(allowedDirectory);
+		// Step 1: Canonicalize both paths to their absolute forms
+		// This resolves all relative components (., .., symlinks, etc.)
+		const canonicalFilePath = path.resolve(filePath);
+		const canonicalBaseDirectory = path.resolve(allowedDirectory);
 
-		// Check if the normalized path starts with the allowed directory
-		// This prevents path traversal attacks like "../../../etc/passwd"
-		const isWithinAllowedDir =
-			normalizedPath.startsWith(normalizedAllowedDir + path.sep) ||
-			normalizedPath === normalizedAllowedDir;
+		// Step 2: Ensure the canonicalized file path starts with the canonicalized base directory
+		// This is the core defense against path traversal attacks
+		const isWithinBaseDirectory =
+			canonicalFilePath.startsWith(canonicalBaseDirectory + path.sep) ||
+			canonicalFilePath === canonicalBaseDirectory;
 
-		// Additional security checks
+		// Step 3: Additional security checks for common bypass attempts
 		const containsDangerousPatterns =
-			filePath.includes("..") ||
-			filePath.includes("~") ||
-			filePath.includes("\0") || // null byte
-			filePath.includes("%00"); // URL encoded null byte
+			filePath.includes("..") || // Directory traversal
+			filePath.includes("~") || // Home directory expansion
+			filePath.includes("\0") || // Null byte injection
+			filePath.includes("%00") || // URL encoded null byte
+			filePath.includes("%2e%2e") || // URL encoded ..
+			filePath.includes("%2f") || // URL encoded /
+			filePath.includes("%5c"); // URL encoded \
 
-		return isWithinAllowedDir && !containsDangerousPatterns;
+		// Step 4: Verify the path doesn't contain any dangerous characters
+		const hasInvalidChars = /[<>"|*?]/.test(filePath);
+
+		return (
+			isWithinBaseDirectory && !containsDangerousPatterns && !hasInvalidChars
+		);
 	} catch (error) {
-		// If there's any error in path resolution, reject the path
+		// If path resolution fails for any reason, deny access
+		console.error("Path validation error:", error);
+		return false;
+	}
+}
+
+// Enhanced security function to validate and canonicalize directory paths
+function validateAndCanonicalizeDirectory(dirPath: string): string {
+	try {
+		// Canonicalize the directory path
+		const canonicalPath = path.resolve(dirPath);
+
+		// Additional validation for directory paths
+		if (canonicalPath.includes("..") || canonicalPath.includes("~")) {
+			throw new Error(`Invalid directory path: ${dirPath}`);
+		}
+
+		return canonicalPath;
+	} catch (error) {
+		throw new Error(`Failed to validate directory path: ${dirPath}`);
+	}
+}
+
+// Security function to validate file operations with canonicalized paths
+function secureFileOperation(
+	filePath: string,
+	baseDirectory: string,
+	operation: string
+): boolean {
+	try {
+		// Canonicalize both paths
+		const canonicalFilePath = path.resolve(filePath);
+		const canonicalBaseDir = path.resolve(baseDirectory);
+
+		// Verify the file is within the base directory
+		const isWithinBase =
+			canonicalFilePath.startsWith(canonicalBaseDir + path.sep) ||
+			canonicalFilePath === canonicalBaseDir;
+
+		if (!isWithinBase) {
+			console.warn(
+				`Security violation: ${operation} attempted outside base directory`
+			);
+			console.warn(`File path: ${canonicalFilePath}`);
+			console.warn(`Base directory: ${canonicalBaseDir}`);
+			return false;
+		}
+
+		return true;
+	} catch (error) {
+		console.error(`Security check failed for ${operation}:`, error);
 		return false;
 	}
 }
@@ -269,12 +320,16 @@ export async function registerRoutes(app: Express): Promise<Server> {
 		try {
 			const tracks = await storage.getAudioTracksByUserId(demoUser.id);
 
-			// Delete files with security validation
+			// Delete files with enhanced security validation
 			for (const track of tracks) {
 				// Validate and delete original file
 				if (
 					track.originalPath &&
-					validateFilePath(track.originalPath, normalizedUploadsDir)
+					secureFileOperation(
+						track.originalPath,
+						normalizedUploadsDir,
+						"delete"
+					)
 				) {
 					if (fs.existsSync(track.originalPath)) {
 						fs.unlinkSync(track.originalPath);
@@ -284,7 +339,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
 				// Validate and delete extended files
 				if (track.extendedPaths && Array.isArray(track.extendedPaths)) {
 					for (const filePath of track.extendedPaths) {
-						if (validateFilePath(filePath, normalizedResultDir)) {
+						if (secureFileOperation(filePath, normalizedResultDir, "delete")) {
 							if (fs.existsSync(filePath)) {
 								fs.unlinkSync(filePath);
 							}
@@ -335,17 +390,25 @@ export async function registerRoutes(app: Express): Promise<Server> {
 				settings: settings,
 			});
 
-			// Generate a filename for the extended version
+			// Generate a filename for the extended version with security validation
 			const outputBase = path.basename(
 				track.originalFilename,
 				path.extname(track.originalFilename)
 			);
 			const fileExt = path.extname(track.originalFilename);
 			const version = track.extendedPaths?.length || 0;
-			const outputPath = path.join(
-				normalizedResultDir,
-				`${sanitizeFilename(outputBase)}_extended_v${version + 1}${fileExt}`
-			);
+			const sanitizedBaseName = sanitizeFilename(outputBase);
+			const outputFilename = `${sanitizedBaseName}_extended_v${
+				version + 1
+			}${fileExt}`;
+			const outputPath = path.join(normalizedResultDir, outputFilename);
+
+			// Security: Validate the generated output path is within the results directory
+			if (!validateFilePath(outputPath, normalizedResultDir)) {
+				return res.status(500).json({
+					message: "Error: Generated output path is invalid",
+				});
+			}
 
 			// Execute the Python script for audio processing
 			const options = {
@@ -490,9 +553,13 @@ export async function registerRoutes(app: Express): Promise<Server> {
 				return res.status(400).json({ message: "Invalid file type" });
 			}
 
-			// Security: Validate file path to prevent path traversal
-			const isUploadFile = validateFilePath(filePath, normalizedUploadsDir);
-			const isResultFile = validateFilePath(filePath, normalizedResultDir);
+			// Security: Enhanced path validation with canonicalization
+			const isUploadFile =
+				validateFilePath(filePath, normalizedUploadsDir) &&
+				secureFileOperation(filePath, normalizedUploadsDir, "read");
+			const isResultFile =
+				validateFilePath(filePath, normalizedResultDir) &&
+				secureFileOperation(filePath, normalizedResultDir, "read");
 
 			if (!isUploadFile && !isResultFile) {
 				return res
@@ -572,8 +639,11 @@ export async function registerRoutes(app: Express): Promise<Server> {
 				return res.status(400).json({ message: "Invalid file type" });
 			}
 
-			// Security: Validate file path to prevent path traversal
-			if (!validateFilePath(filePath, normalizedResultDir)) {
+			// Security: Enhanced path validation with canonicalization
+			if (
+				!validateFilePath(filePath, normalizedResultDir) ||
+				!secureFileOperation(filePath, normalizedResultDir, "download")
+			) {
 				return res
 					.status(403)
 					.json({ message: "Access denied: Invalid file path" });
